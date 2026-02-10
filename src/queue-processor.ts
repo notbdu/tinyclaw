@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Queue Processor - Handles messages from all channels (WhatsApp, Telegram, etc.)
- * Processes one message at a time to avoid race conditions
+ * Queue Processor - Sends messages to a persistent Claude Code tmux session
+ * via send-keys, and watches the output log for responses.
  */
 
 import { execSync } from 'child_process';
@@ -9,29 +9,23 @@ import fs from 'fs';
 import path from 'path';
 
 const SCRIPT_DIR = path.resolve(__dirname, '..');
+const SETTINGS_FILE = path.join(SCRIPT_DIR, '.tinyclaw/settings.json');
 const QUEUE_INCOMING = path.join(SCRIPT_DIR, '.tinyclaw/queue/incoming');
 const QUEUE_OUTGOING = path.join(SCRIPT_DIR, '.tinyclaw/queue/outgoing');
 const QUEUE_PROCESSING = path.join(SCRIPT_DIR, '.tinyclaw/queue/processing');
 const LOG_FILE = path.join(SCRIPT_DIR, '.tinyclaw/logs/queue.log');
-const RESET_FLAG = path.join(SCRIPT_DIR, '.tinyclaw/reset_flag');
-const MODEL_CONFIG = path.join(SCRIPT_DIR, '.tinyclaw/model');
 
-// Model name mapping
-const MODEL_IDS: Record<string, string> = {
-    'sonnet': 'claude-sonnet-4-5',
-    'opus': 'claude-opus-4-6',
-};
+// Claude output log written by tmux pipe-pane
+const CLAUDE_OUTPUT_LOG = path.join(SCRIPT_DIR, 'claude-output.log');
 
-function getModelFlag(): string {
-    try {
-        const model = fs.readFileSync(MODEL_CONFIG, 'utf8').trim();
-        const modelId = MODEL_IDS[model];
-        if (modelId) {
-            return `--model ${modelId} `;
-        }
-    } catch { }
-    return '';
-}
+// tmux target for the persistent Claude session
+const TMUX_TARGET = '0:imperial-clawflict.0';
+
+// How long to wait for Claude to respond before giving up (ms)
+const RESPONSE_TIMEOUT = 600000; // 10 minutes
+
+// How long Claude must be quiet before we consider the response complete (ms)
+const QUIET_THRESHOLD = 5000; // 5 seconds of no new output
 
 // Ensure directories exist
 [QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING, path.dirname(LOG_FILE)].forEach(dir => {
@@ -58,12 +52,138 @@ interface ResponseData {
     messageId: string;
 }
 
+// Strip ANSI escape sequences and Claude Code TUI artifacts from terminal output
+function cleanTerminalOutput(raw: string): string {
+    let text = raw;
+
+    // Strip OSC sequences (window titles etc): \x1b] ... \x07 or \x1b\\
+    text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
+
+    // Strip CSI sequences: \x1b[ ... <letter>
+    text = text.replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]/g, '');
+
+    // Strip DEC private mode: \x1b[? ... h/l
+    text = text.replace(/\x1b\[\?[0-9;]*[hl]/g, '');
+
+    // Strip remaining escape sequences
+    text = text.replace(/\x1b[^[\x1b]?/g, '');
+
+    // Strip any leftover raw control chars except newline/tab
+    text = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+
+    // Split into lines for filtering
+    const lines = text.split('\n');
+    const filtered = lines.filter(line => {
+        const trimmed = line.trim();
+
+        // Skip empty lines (will rejoin later)
+        if (!trimmed) return false;
+
+        // Skip spinner lines (just spinner chars and whitespace)
+        if (/^[✻✳✶✢·✽⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿]\s*(Whirring|Thinking|Working).*$/i.test(trimmed)) return false;
+
+        // Skip bare spinner chars
+        if (/^[✻✳✶✢·✽⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿\s]*$/.test(trimmed)) return false;
+
+        // Skip prompt lines
+        if (/^❯\s*$/.test(trimmed)) return false;
+
+        // Skip status bar lines
+        if (/⏵⏵\s*bypass\s*permissions/i.test(trimmed)) return false;
+
+        // Skip separator lines (────)
+        if (/^[─━─\-]{5,}$/.test(trimmed)) return false;
+
+        // Skip Claude Code UI chrome (esc to interrupt, shift+tab, ctrl+t)
+        if (/esc\s+to\s+interrupt|shift\+tab\s+to\s+cycle|ctrl\+t\s+to\s+hide/i.test(trimmed)) return false;
+
+        return true;
+    });
+
+    // Rejoin and collapse excessive blank lines
+    return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 // Logger
 function log(level: string, message: string): void {
     const timestamp = new Date().toISOString();
     const logMessage = `[${timestamp}] [${level}] ${message}\n`;
     console.log(logMessage.trim());
     fs.appendFileSync(LOG_FILE, logMessage);
+}
+
+// Send a message to the Claude tmux pane
+function sendToClaudePane(message: string): void {
+    // Escape single quotes for the shell
+    const escaped = message.replace(/'/g, "'\\''");
+    execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
+    execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+}
+
+// Get the current size of the Claude output log
+function getOutputLogSize(): number {
+    try {
+        const stat = fs.statSync(CLAUDE_OUTPUT_LOG);
+        return stat.size;
+    } catch {
+        return 0;
+    }
+}
+
+// Read new content from the output log since a given byte offset
+function readNewOutput(fromByte: number): string {
+    try {
+        const fd = fs.openSync(CLAUDE_OUTPUT_LOG, 'r');
+        const stat = fs.fstatSync(fd);
+        const bytesToRead = stat.size - fromByte;
+        if (bytesToRead <= 0) {
+            fs.closeSync(fd);
+            return '';
+        }
+        const buffer = Buffer.alloc(bytesToRead);
+        fs.readSync(fd, buffer, 0, bytesToRead, fromByte);
+        fs.closeSync(fd);
+        return buffer.toString('utf8');
+    } catch {
+        return '';
+    }
+}
+
+// Wait for Claude to finish responding by watching the output log
+async function waitForResponse(startByte: number): Promise<string> {
+    return new Promise((resolve) => {
+        const startTime = Date.now();
+        let lastSize = startByte;
+        let lastChangeTime = Date.now();
+        let settled = false;
+
+        const check = setInterval(() => {
+            const currentSize = getOutputLogSize();
+
+            if (currentSize > lastSize) {
+                // New output arrived
+                lastSize = currentSize;
+                lastChangeTime = Date.now();
+            } else if (currentSize === lastSize && !settled) {
+                // No new output — check if quiet long enough
+                const quietFor = Date.now() - lastChangeTime;
+                if (quietFor >= QUIET_THRESHOLD && lastSize > startByte) {
+                    // Claude has been quiet for QUIET_THRESHOLD and we have some output
+                    settled = true;
+                    clearInterval(check);
+                    const newContent = readNewOutput(startByte);
+                    resolve(newContent.trim());
+                }
+            }
+
+            // Timeout
+            if (Date.now() - startTime > RESPONSE_TIMEOUT) {
+                clearInterval(check);
+                const newContent = readNewOutput(startByte);
+                resolve(newContent.trim() || '(Response timed out)');
+            }
+        }, 500);
+    });
 }
 
 // Process a single message
@@ -76,62 +196,46 @@ async function processMessage(messageFile: string): Promise<void> {
 
         // Read message
         const messageData: MessageData = JSON.parse(fs.readFileSync(processingFile, 'utf8'));
-        const { channel, sender, message, timestamp, messageId } = messageData;
+        const { channel, sender, message, messageId } = messageData;
 
         log('INFO', `Processing [${channel}] from ${sender}: ${message.substring(0, 50)}...`);
 
-        // Check if we should reset conversation (start fresh without -c)
-        const shouldReset = fs.existsSync(RESET_FLAG);
-        const continueFlag = shouldReset ? '' : '-c ';
+        // Record current output log size before sending
+        const startByte = getOutputLogSize();
 
-        if (shouldReset) {
-            log('INFO', '🔄 Resetting conversation (starting fresh without -c)');
-            fs.unlinkSync(RESET_FLAG);
-        }
+        // Send message to Claude via tmux send-keys
+        sendToClaudePane(message);
+        log('INFO', `Sent to Claude pane (${TMUX_TARGET})`);
 
-        // Call Claude
-        let response: string;
-        try {
-            const modelFlag = getModelFlag();
-            response = execSync(
-                `cd "${SCRIPT_DIR}" && claude --dangerously-skip-permissions ${modelFlag}${continueFlag}-p "${message.replace(/"/g, '\\"')}"`,
-                {
-                    encoding: "utf-8",
-                    timeout: 120000, // 2 minute timeout
-                    maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-                },
-            );
-        } catch (error) {
-            log('ERROR', `Claude error: ${(error as Error).message}`);
-            response = "Sorry, I encountered an error processing your request.";
-        }
+        // Wait for Claude to respond
+        const rawResponse = await waitForResponse(startByte);
 
-        // Clean response
-        response = response.trim();
+        // Clean terminal escape codes and TUI artifacts
+        const response = cleanTerminalOutput(rawResponse);
 
-        // Limit response length
-        if (response.length > 4000) {
-            response = response.substring(0, 3900) + '\n\n[Response truncated...]';
+        // Limit response length for Discord
+        let trimmedResponse = response;
+        if (trimmedResponse.length > 4000) {
+            trimmedResponse = trimmedResponse.substring(0, 3900) + '\n\n[Response truncated...]';
         }
 
         // Write response to outgoing queue
         const responseData: ResponseData = {
             channel,
             sender,
-            message: response,
+            message: trimmedResponse || '(No response captured — check tmux session)',
             originalMessage: message,
             timestamp: Date.now(),
             messageId
         };
 
-        // For heartbeat messages, write to a separate location (they handle their own responses)
         const responseFile = channel === 'heartbeat'
             ? path.join(QUEUE_OUTGOING, `${messageId}.json`)
             : path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
 
         fs.writeFileSync(responseFile, JSON.stringify(responseData, null, 2));
 
-        log('INFO', `✓ Response ready [${channel}] ${sender} (${response.length} chars)`);
+        log('INFO', `✓ Response ready [${channel}] ${sender} (${trimmedResponse.length} chars)`);
 
         // Clean up processing file
         fs.unlinkSync(processingFile);
@@ -183,7 +287,9 @@ async function processQueue(): Promise<void> {
 }
 
 // Main loop
-log('INFO', 'Queue processor started');
+log('INFO', 'Queue processor started (tmux send-keys mode)');
+log('INFO', `Tmux target: ${TMUX_TARGET}`);
+log('INFO', `Claude output log: ${CLAUDE_OUTPUT_LOG}`);
 log('INFO', `Watching: ${QUEUE_INCOMING}`);
 
 // Process queue every 1 second

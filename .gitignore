@@ -15,7 +15,7 @@ dist/
 *.log
 
 # Environment variables
-.env
+.env*
 
 # OS files
 .DS_Store
@@ -24,3 +24,4 @@ dist/
 .vscode/
 .idea/
 *.swp
+

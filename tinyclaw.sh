@@ -314,8 +314,13 @@ send_message() {
 
     log "[$source] Sending: ${message:0:50}..."
 
+    # Use working_dir from settings if set, otherwise fall back to SCRIPT_DIR
+    local WORK_DIR
+    WORK_DIR=$(grep -o '"working_dir"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS_FILE" 2>/dev/null | cut -d'"' -f4)
+    WORK_DIR="${WORK_DIR:-$SCRIPT_DIR}"
+
     # Use claude -c -p to continue and get final response
-    cd "$SCRIPT_DIR"
+    cd "$WORK_DIR"
     RESPONSE=$(claude --dangerously-skip-permissions -c -p "$message" 2>&1)
 
     echo "$RESPONSE"
