@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Queue Processor - Sends messages to a persistent Claude Code tmux session
- * via send-keys, and watches the output log for responses.
+ * via send-keys. Captures responses by tailing Claude's JSONL conversation logs.
  */
 
 import { execSync } from 'child_process';
@@ -9,23 +9,28 @@ import fs from 'fs';
 import path from 'path';
 
 const SCRIPT_DIR = path.resolve(__dirname, '..');
-const SETTINGS_FILE = path.join(SCRIPT_DIR, '.tinyclaw/settings.json');
 const QUEUE_INCOMING = path.join(SCRIPT_DIR, '.tinyclaw/queue/incoming');
 const QUEUE_OUTGOING = path.join(SCRIPT_DIR, '.tinyclaw/queue/outgoing');
 const QUEUE_PROCESSING = path.join(SCRIPT_DIR, '.tinyclaw/queue/processing');
 const LOG_FILE = path.join(SCRIPT_DIR, '.tinyclaw/logs/queue.log');
 
-// Claude output log written by tmux pipe-pane
-const CLAUDE_OUTPUT_LOG = path.join(SCRIPT_DIR, 'claude-output.log');
+// Claude Code writes structured JSONL conversation logs here
+const JSONL_DIR = path.join(
+    process.env.HOME || '',
+    '.claude/projects/-Users-shakeshack-Documents-sandbox-imperial-clawflict'
+);
+
+// Directory where Claude writes plan files
+const PLANS_DIR = path.join(process.env.HOME || '', '.claude/plans');
 
 // tmux target for the persistent Claude session
 const TMUX_TARGET = '0:imperial-clawflict.0';
 
-// How long to wait for Claude to respond before giving up (ms)
-const RESPONSE_TIMEOUT = 600000; // 10 minutes
+// How long to wait for a response (ms)
+const RESPONSE_TIMEOUT = 10800000; // 3 hours
 
-// How long Claude must be quiet before we consider the response complete (ms)
-const QUIET_THRESHOLD = 5000; // 5 seconds of no new output
+// How long the JSONL file must be quiet before we consider the response complete (ms)
+const QUIET_THRESHOLD = 5000;
 
 // Ensure directories exist
 [QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING, path.dirname(LOG_FILE)].forEach(dir => {
@@ -52,57 +57,19 @@ interface ResponseData {
     messageId: string;
 }
 
-// Strip ANSI escape sequences and Claude Code TUI artifacts from terminal output
-function cleanTerminalOutput(raw: string): string {
-    let text = raw;
-
-    // Strip OSC sequences (window titles etc): \x1b] ... \x07 or \x1b\\
-    text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
-
-    // Strip CSI sequences: \x1b[ ... <letter>
-    text = text.replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]/g, '');
-
-    // Strip DEC private mode: \x1b[? ... h/l
-    text = text.replace(/\x1b\[\?[0-9;]*[hl]/g, '');
-
-    // Strip remaining escape sequences
-    text = text.replace(/\x1b[^[\x1b]?/g, '');
-
-    // Strip any leftover raw control chars except newline/tab
-    text = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
-
-    // Split into lines for filtering
-    const lines = text.split('\n');
-    const filtered = lines.filter(line => {
-        const trimmed = line.trim();
-
-        // Skip empty lines (will rejoin later)
-        if (!trimmed) return false;
-
-        // Skip spinner lines (just spinner chars and whitespace)
-        if (/^[✻✳✶✢·✽⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿]\s*(Whirring|Thinking|Working).*$/i.test(trimmed)) return false;
-
-        // Skip bare spinner chars
-        if (/^[✻✳✶✢·✽⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿\s]*$/.test(trimmed)) return false;
-
-        // Skip prompt lines
-        if (/^❯\s*$/.test(trimmed)) return false;
-
-        // Skip status bar lines
-        if (/⏵⏵\s*bypass\s*permissions/i.test(trimmed)) return false;
-
-        // Skip separator lines (────)
-        if (/^[─━─\-]{5,}$/.test(trimmed)) return false;
-
-        // Skip Claude Code UI chrome (esc to interrupt, shift+tab, ctrl+t)
-        if (/esc\s+to\s+interrupt|shift\+tab\s+to\s+cycle|ctrl\+t\s+to\s+hide/i.test(trimmed)) return false;
-
-        return true;
-    });
-
-    // Rejoin and collapse excessive blank lines
-    return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+interface QuestionOption {
+    label: string;
+    description: string;
 }
+
+interface PendingInteraction {
+    type: 'question' | 'plan';
+    options?: QuestionOption[];
+    question?: string;
+}
+
+// Module-level state: tracks if Claude is waiting for interactive input
+let pendingInteraction: PendingInteraction | null = null;
 
 // Logger
 function log(level: string, message: string): void {
@@ -113,76 +80,380 @@ function log(level: string, message: string): void {
 }
 
 // Send a message to the Claude tmux pane
-function sendToClaudePane(message: string): void {
-    // Escape single quotes for the shell
-    const escaped = message.replace(/'/g, "'\\''");
+function sendToClaudePane(message: string, sender: string): void {
+    const prefixed = `[Discord message from ${sender}]: ${message}`;
+    const escaped = prefixed.replace(/'/g, "'\\''");
     execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
     execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
 }
 
-// Get the current size of the Claude output log
-function getOutputLogSize(): number {
+// Snapshot all .jsonl files and their line counts
+function snapshotJsonlFiles(): Map<string, number> {
+    const snapshot = new Map<string, number>();
     try {
-        const stat = fs.statSync(CLAUDE_OUTPUT_LOG);
-        return stat.size;
+        if (!fs.existsSync(JSONL_DIR)) return snapshot;
+        for (const f of fs.readdirSync(JSONL_DIR)) {
+            if (!f.endsWith('.jsonl')) continue;
+            const filePath = path.join(JSONL_DIR, f);
+            snapshot.set(filePath, getFileLineCount(filePath));
+        }
+    } catch {}
+    return snapshot;
+}
+
+// After sending a message, detect which .jsonl file grew (that's the active session)
+function detectActiveJsonlFile(before: Map<string, number>): { file: string; startLine: number } | null {
+    try {
+        if (!fs.existsSync(JSONL_DIR)) return null;
+        for (const f of fs.readdirSync(JSONL_DIR)) {
+            if (!f.endsWith('.jsonl')) continue;
+            const filePath = path.join(JSONL_DIR, f);
+            const currentLines = getFileLineCount(filePath);
+            const prevLines = before.get(filePath) ?? 0;
+            if (currentLines > prevLines) {
+                return { file: filePath, startLine: prevLines };
+            }
+        }
+        // Also check for entirely new files
+        for (const f of fs.readdirSync(JSONL_DIR)) {
+            if (!f.endsWith('.jsonl')) continue;
+            const filePath = path.join(JSONL_DIR, f);
+            if (!before.has(filePath)) {
+                return { file: filePath, startLine: 0 };
+            }
+        }
+    } catch {}
+    return null;
+}
+
+// Count lines in a file
+function getFileLineCount(filePath: string): number {
+    try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        if (!content) return 0;
+        return content.split('\n').filter(line => line.trim().length > 0).length;
     } catch {
         return 0;
     }
 }
 
-// Read new content from the output log since a given byte offset
-function readNewOutput(fromByte: number): string {
+// Read new lines from a JSONL file after a given line number
+function readNewLines(filePath: string, afterLine: number): string[] {
     try {
-        const fd = fs.openSync(CLAUDE_OUTPUT_LOG, 'r');
-        const stat = fs.fstatSync(fd);
-        const bytesToRead = stat.size - fromByte;
-        if (bytesToRead <= 0) {
-            fs.closeSync(fd);
-            return '';
-        }
-        const buffer = Buffer.alloc(bytesToRead);
-        fs.readSync(fd, buffer, 0, bytesToRead, fromByte);
-        fs.closeSync(fd);
-        return buffer.toString('utf8');
+        const content = fs.readFileSync(filePath, 'utf8');
+        const allLines = content.split('\n').filter(line => line.trim().length > 0);
+        return allLines.slice(afterLine);
     } catch {
-        return '';
+        return [];
     }
 }
 
-// Wait for Claude to finish responding by watching the output log
-async function waitForResponse(startByte: number): Promise<string> {
+// Check if new lines contain a turn_duration system entry (definitive end of turn)
+function hasTurnEnded(newLines: string[]): boolean {
+    for (let i = newLines.length - 1; i >= 0; i--) {
+        try {
+            const entry = JSON.parse(newLines[i]);
+            if (entry.type === 'system' && entry.subtype === 'turn_duration') {
+                return true;
+            }
+        } catch {}
+    }
+    return false;
+}
+
+// Extract the last assistant text from JSONL lines
+function extractLastAssistantText(newLines: string[]): string | null {
+    if (newLines.length === 0) return null;
+
+    // Walk backwards to find the last assistant message with text content
+    for (let i = newLines.length - 1; i >= 0; i--) {
+        try {
+            const entry = JSON.parse(newLines[i]);
+            if (entry.type === 'assistant' && entry.message?.content) {
+                const textBlocks = entry.message.content
+                    .filter((block: any) => block.type === 'text' && block.text?.trim())
+                    .map((block: any) => block.text.trim());
+
+                if (textBlocks.length > 0) {
+                    return textBlocks.join('\n\n');
+                }
+            }
+        } catch {
+            // Skip malformed lines
+        }
+    }
+
+    return null;
+}
+
+// Check if the JSONL shows Claude waiting for interactive input (AskUserQuestion / ExitPlanMode)
+function checkForPendingInteraction(newLines: string[]): PendingInteraction | null {
+    // Walk backwards to find the last assistant entry
+    for (let i = newLines.length - 1; i >= 0; i--) {
+        try {
+            const entry = JSON.parse(newLines[i]);
+            if (entry.type !== 'assistant') continue;
+
+            for (const block of entry.message?.content || []) {
+                if (block.type !== 'tool_use') continue;
+
+                if (block.name === 'AskUserQuestion') {
+                    const q = block.input?.questions?.[0];
+                    if (q) {
+                        return {
+                            type: 'question',
+                            question: q.question,
+                            options: q.options || [],
+                        };
+                    }
+                }
+
+                if (block.name === 'ExitPlanMode') {
+                    return { type: 'plan' };
+                }
+            }
+
+            // If last assistant entry isn't a tool_use for these, no pending interaction
+            break;
+        } catch {}
+    }
+    return null;
+}
+
+// Check that a tool_result hasn't already been received for the pending interaction
+function hasToolResult(newLines: string[], afterIndex: number): boolean {
+    for (let i = afterIndex + 1; i < newLines.length; i++) {
+        try {
+            const entry = JSON.parse(newLines[i]);
+            if (entry.type === 'user') {
+                const content = entry.message?.content;
+                if (Array.isArray(content)) {
+                    for (const b of content) {
+                        if (b.type === 'tool_result') return true;
+                    }
+                }
+            }
+        } catch {}
+    }
+    return false;
+}
+
+// Find the line index of the last pending interaction tool_use
+function findInteractionIndex(newLines: string[]): number {
+    for (let i = newLines.length - 1; i >= 0; i--) {
+        try {
+            const entry = JSON.parse(newLines[i]);
+            if (entry.type === 'assistant') {
+                for (const block of entry.message?.content || []) {
+                    if (block.type === 'tool_use' &&
+                        (block.name === 'AskUserQuestion' || block.name === 'ExitPlanMode')) {
+                        return i;
+                    }
+                }
+            }
+        } catch {}
+    }
+    return -1;
+}
+
+// Format a pending interaction as a Discord message
+function formatInteractionForDiscord(interaction: PendingInteraction): string {
+    if (interaction.type === 'question' && interaction.options) {
+        let msg = `**Claude is asking a question:**\n\n${interaction.question}\n\n`;
+        interaction.options.forEach((opt, i) => {
+            msg += `**${i + 1}.** ${opt.label} — ${opt.description}\n`;
+        });
+        msg += `\nReply with a number (1-${interaction.options.length}) to select, or type a custom answer.`;
+        return msg;
+    }
+
+    if (interaction.type === 'plan') {
+        return `**Claude has a plan ready for approval.**\n\nReply **yes** to approve or provide feedback to reject.`;
+    }
+
+    return '(Claude is waiting for input — check tmux session)';
+}
+
+// Send keystrokes to the TUI to respond to an interactive prompt
+function sendInteractionKeystroke(interaction: PendingInteraction, userReply: string): void {
+    const reply = userReply.trim();
+
+    if (interaction.type === 'question' && interaction.options) {
+        const optionNum = parseInt(reply, 10);
+        if (optionNum >= 1 && optionNum <= interaction.options.length) {
+            // Navigate to option: Down arrow (N-1) times, then Enter
+            for (let i = 1; i < optionNum; i++) {
+                execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+            }
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+            log('INFO', `Selected option ${optionNum}: ${interaction.options[optionNum - 1].label}`);
+        } else {
+            // "Other" — navigate past all options to Other, then type text
+            for (let i = 0; i <= interaction.options.length; i++) {
+                execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+            }
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+            // Type the custom text
+            const escaped = reply.replace(/'/g, "'\\''");
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+            log('INFO', `Selected Other with text: ${reply.substring(0, 50)}`);
+        }
+    } else if (interaction.type === 'plan') {
+        const isApproval = /^(y|yes|approve|accept|ok|go|lgtm)$/i.test(reply);
+        if (isApproval) {
+            // Accept the plan — press Enter (default accept)
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+            log('INFO', 'Approved plan');
+        } else {
+            // Reject — press Escape, then type feedback as next message
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Escape`);
+            const escaped = reply.replace(/'/g, "'\\''");
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+            log('INFO', `Rejected plan with feedback: ${reply.substring(0, 50)}`);
+        }
+    }
+}
+
+// Snapshot plan files at a point in time
+function snapshotPlans(): Map<string, number> {
+    const snapshot = new Map<string, number>();
+    try {
+        if (fs.existsSync(PLANS_DIR)) {
+            for (const file of fs.readdirSync(PLANS_DIR)) {
+                if (file.endsWith('.md')) {
+                    const filePath = path.join(PLANS_DIR, file);
+                    const stat = fs.statSync(filePath);
+                    snapshot.set(filePath, stat.mtimeMs);
+                }
+            }
+        }
+    } catch {}
+    return snapshot;
+}
+
+// Check for new or modified plan files since a snapshot
+function checkForNewPlan(before: Map<string, number>): string | null {
+    try {
+        if (!fs.existsSync(PLANS_DIR)) return null;
+        for (const file of fs.readdirSync(PLANS_DIR)) {
+            if (!file.endsWith('.md')) continue;
+            const filePath = path.join(PLANS_DIR, file);
+            const stat = fs.statSync(filePath);
+            const prevMtime = before.get(filePath);
+            if (prevMtime === undefined || stat.mtimeMs > prevMtime) {
+                const content = fs.readFileSync(filePath, 'utf8').trim();
+                if (content.length > 0) {
+                    return `**Claude has a plan ready for approval:**\n\n${content}`;
+                }
+            }
+        }
+    } catch {}
+    return null;
+}
+
+// Wait for Claude's response by watching all JSONL files for growth
+async function waitForResponse(beforeSnapshot: Map<string, number>): Promise<string> {
+    const plansBefore = snapshotPlans();
+
     return new Promise((resolve) => {
         const startTime = Date.now();
-        let lastSize = startByte;
-        let lastChangeTime = Date.now();
-        let settled = false;
+        let activeFile: string | null = null;
+        let startLine = 0;
+        let lastLineCount = 0;
+        let lastGrowthAt = 0;
+        let planLastChecked = Date.now();
 
         const check = setInterval(() => {
-            const currentSize = getOutputLogSize();
+            // Phase 1: Detect which file is receiving our message
+            if (!activeFile) {
+                const detected = detectActiveJsonlFile(beforeSnapshot);
+                if (detected) {
+                    activeFile = detected.file;
+                    startLine = detected.startLine;
+                    lastLineCount = getFileLineCount(activeFile);
+                    lastGrowthAt = Date.now();
+                    log('INFO', `Detected active JSONL: ${path.basename(activeFile)} (from line ${startLine})`);
+                }
+            }
 
-            if (currentSize > lastSize) {
-                // New output arrived
-                lastSize = currentSize;
-                lastChangeTime = Date.now();
-            } else if (currentSize === lastSize && !settled) {
-                // No new output — check if quiet long enough
-                const quietFor = Date.now() - lastChangeTime;
-                if (quietFor >= QUIET_THRESHOLD && lastSize > startByte) {
-                    // Claude has been quiet for QUIET_THRESHOLD and we have some output
-                    settled = true;
+            // Phase 2: Once we know the file, check for turn completion
+            if (activeFile) {
+                const currentLineCount = getFileLineCount(activeFile);
+
+                if (currentLineCount > lastLineCount) {
+                    lastLineCount = currentLineCount;
+                    lastGrowthAt = Date.now();
+                }
+
+                const newLines = readNewLines(activeFile, startLine);
+
+                // Primary signal: system entry with subtype "turn_duration" = turn is done
+                if (hasTurnEnded(newLines)) {
                     clearInterval(check);
-                    const newContent = readNewOutput(startByte);
-                    resolve(newContent.trim());
+                    const text = extractLastAssistantText(newLines);
+                    if (text) {
+                        log('INFO', 'Turn ended (turn_duration detected)');
+                        resolve(text);
+                    } else {
+                        resolve('(Claude completed work but produced no text response — check tmux session)');
+                    }
+                    return;
+                }
+
+                // Fallback: quiet period — check for pending interaction or plain text
+                if (lastGrowthAt > 0 && newLines.length > 0) {
+                    const quietFor = Date.now() - lastGrowthAt;
+                    if (quietFor >= QUIET_THRESHOLD) {
+                        // Check if Claude is waiting for interactive input
+                        const interactionIdx = findInteractionIndex(newLines);
+                        if (interactionIdx >= 0 && !hasToolResult(newLines, interactionIdx)) {
+                            const interaction = checkForPendingInteraction(newLines);
+                            if (interaction) {
+                                clearInterval(check);
+                                pendingInteraction = interaction;
+                                log('INFO', `Detected pending ${interaction.type} interaction`);
+                                resolve(formatInteractionForDiscord(interaction));
+                                return;
+                            }
+                        }
+
+                        // Otherwise return last text if available
+                        const text = extractLastAssistantText(newLines);
+                        if (text) {
+                            clearInterval(check);
+                            log('INFO', `Responding after ${QUIET_THRESHOLD}ms quiet (no turn_duration yet)`);
+                            resolve(text);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Check for new plan files every 5 seconds
+            if (Date.now() - planLastChecked >= 5000) {
+                planLastChecked = Date.now();
+                const plan = checkForNewPlan(plansBefore);
+                if (plan) {
+                    clearInterval(check);
+                    resolve(plan);
+                    return;
                 }
             }
 
             // Timeout
             if (Date.now() - startTime > RESPONSE_TIMEOUT) {
                 clearInterval(check);
-                const newContent = readNewOutput(startByte);
-                resolve(newContent.trim() || '(Response timed out)');
+                if (activeFile) {
+                    const newLines = readNewLines(activeFile, startLine);
+                    const text = extractLastAssistantText(newLines);
+                    resolve(text || '(Response timed out — check tmux session)');
+                } else {
+                    resolve('(Response timed out — no JSONL activity detected)');
+                }
             }
-        }, 500);
+        }, 1000);
     });
 }
 
@@ -200,18 +471,24 @@ async function processMessage(messageFile: string): Promise<void> {
 
         log('INFO', `Processing [${channel}] from ${sender}: ${message.substring(0, 50)}...`);
 
-        // Record current output log size before sending
-        const startByte = getOutputLogSize();
+        // Snapshot all JSONL files before sending the message
+        const beforeSnapshot = snapshotJsonlFiles();
+        log('INFO', `Snapshotted ${beforeSnapshot.size} JSONL file(s)`);
 
-        // Send message to Claude via tmux send-keys
-        sendToClaudePane(message);
-        log('INFO', `Sent to Claude pane (${TMUX_TARGET})`);
+        // Check if this is a response to a pending interaction (question/plan)
+        if (pendingInteraction) {
+            const interaction = pendingInteraction;
+            pendingInteraction = null;
+            log('INFO', `Responding to pending ${interaction.type} interaction: ${message.substring(0, 50)}`);
+            sendInteractionKeystroke(interaction, message);
+        } else {
+            // Normal message — send with prefix
+            sendToClaudePane(message, sender);
+        }
+        log('INFO', `Sent to Claude pane (${TMUX_TARGET}), watching for JSONL growth...`);
 
-        // Wait for Claude to respond
-        const rawResponse = await waitForResponse(startByte);
-
-        // Clean terminal escape codes and TUI artifacts
-        const response = cleanTerminalOutput(rawResponse);
+        // Wait for response — detects which file grows after our send-keys
+        const response = await waitForResponse(beforeSnapshot);
 
         // Limit response length for Discord
         let trimmedResponse = response;
@@ -223,7 +500,7 @@ async function processMessage(messageFile: string): Promise<void> {
         const responseData: ResponseData = {
             channel,
             sender,
-            message: trimmedResponse || '(No response captured — check tmux session)',
+            message: trimmedResponse,
             originalMessage: message,
             timestamp: Date.now(),
             messageId
@@ -287,9 +564,9 @@ async function processQueue(): Promise<void> {
 }
 
 // Main loop
-log('INFO', 'Queue processor started (tmux send-keys mode)');
+log('INFO', 'Queue processor started (JSONL log tailing mode)');
 log('INFO', `Tmux target: ${TMUX_TARGET}`);
-log('INFO', `Claude output log: ${CLAUDE_OUTPUT_LOG}`);
+log('INFO', `JSONL dir: ${JSONL_DIR}`);
 log('INFO', `Watching: ${QUEUE_INCOMING}`);
 
 // Process queue every 1 second
