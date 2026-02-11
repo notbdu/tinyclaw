@@ -9,28 +9,53 @@ import fs from 'fs';
 import path from 'path';
 
 const SCRIPT_DIR = path.resolve(__dirname, '..');
+const SETTINGS_FILE = path.join(SCRIPT_DIR, '.tinyclaw/settings.json');
 const QUEUE_INCOMING = path.join(SCRIPT_DIR, '.tinyclaw/queue/incoming');
 const QUEUE_OUTGOING = path.join(SCRIPT_DIR, '.tinyclaw/queue/outgoing');
 const QUEUE_PROCESSING = path.join(SCRIPT_DIR, '.tinyclaw/queue/processing');
 const LOG_FILE = path.join(SCRIPT_DIR, '.tinyclaw/logs/queue.log');
 
+// Load settings
+interface Settings {
+    working_dir?: string;
+    tmux_target?: string;
+    [key: string]: unknown;
+}
+
+function loadSettings(): Settings {
+    try {
+        return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    } catch {
+        return {};
+    }
+}
+
+// Derive JSONL_DIR from working_dir: Claude escapes the absolute path,
+// replacing both / and _ with -
+function workingDirToJsonlDir(workingDir: string): string {
+    const escaped = workingDir.replace(/[/_]/g, '-');
+    return path.join(process.env.HOME || '', '.claude/projects', escaped);
+}
+
+const settings = loadSettings();
+
 // Claude Code writes structured JSONL conversation logs here
-const JSONL_DIR = path.join(
-    process.env.HOME || '',
-    '.claude/projects/-Users-shakeshack-Documents-sandbox-imperial-clawflict'
+const JSONL_DIR = workingDirToJsonlDir(
+    settings.working_dir || '/Users/shakeshack/Documents/sandbox/imperial_clawflict'
 );
 
-// Directory where Claude writes plan files
+// Directory where Claude writes plan files (global, not per-project)
 const PLANS_DIR = path.join(process.env.HOME || '', '.claude/plans');
 
 // tmux target for the persistent Claude session
-const TMUX_TARGET = '0:imperial-clawflict.0';
+const TMUX_TARGET = settings.tmux_target || '0:imperial-clawflict.0';
 
 // How long to wait for a response (ms)
 const RESPONSE_TIMEOUT = 10800000; // 3 hours
 
-// How long the JSONL file must be quiet before we consider the response complete (ms)
-const QUIET_THRESHOLD = 5000;
+// How long the JSONL file must be quiet before checking for pending interactions (ms)
+// Only used for AskUserQuestion/ExitPlanMode detection — NOT for regular responses
+const INTERACTION_QUIET_THRESHOLD = 5000;
 
 // Ensure directories exist
 [QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING, path.dirname(LOG_FILE)].forEach(dir => {
@@ -62,10 +87,17 @@ interface QuestionOption {
     description: string;
 }
 
+interface QuestionEntry {
+    question: string;
+    options: QuestionOption[];
+    header?: string;
+}
+
 interface PendingInteraction {
     type: 'question' | 'plan';
-    options?: QuestionOption[];
-    question?: string;
+    questions?: QuestionEntry[];  // all questions (may be 1-4)
+    contextText?: string;         // assistant text before the question/plan
+    planContent?: string;
 }
 
 // Module-level state: tracks if Claude is waiting for interactive input
@@ -81,9 +113,13 @@ function log(level: string, message: string): void {
 
 // Send a message to the Claude tmux pane
 function sendToClaudePane(message: string, sender: string): void {
-    const prefixed = `[Discord message from ${sender}]: ${message}`;
+    // Strip newlines from Discord messages (they'd be interpreted as Enter in the TUI)
+    const cleanMessage = message.replace(/\n/g, ' ');
+    const prefixed = `[Discord message from ${sender}]: ${cleanMessage}`;
     const escaped = prefixed.replace(/'/g, "'\\''");
     execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
+    // Small delay to let the TUI process the text before submitting
+    execSync('sleep 0.2');
     execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
 }
 
@@ -161,6 +197,21 @@ function hasTurnEnded(newLines: string[]): boolean {
     return false;
 }
 
+// Check if the last entry is a system entry like stop_hook_summary
+// (indicates turn may have ended, but turn_duration wasn't written)
+function lastEntryIsSystemBoundary(newLines: string[]): boolean {
+    for (let i = newLines.length - 1; i >= 0; i--) {
+        const line = newLines[i].trim();
+        if (!line) continue;
+        try {
+            const entry = JSON.parse(line);
+            return entry.type === 'system' && entry.subtype === 'stop_hook_summary';
+        } catch {}
+        break;
+    }
+    return false;
+}
+
 // Extract the last assistant text from JSONL lines
 function extractLastAssistantText(newLines: string[]): string | null {
     if (newLines.length === 0) return null;
@@ -186,6 +237,17 @@ function extractLastAssistantText(newLines: string[]): string | null {
     return null;
 }
 
+// Extract the session slug from JSONL lines (used to find the correct plan file)
+function extractSlug(newLines: string[]): string | null {
+    for (const line of newLines) {
+        try {
+            const entry = JSON.parse(line);
+            if (entry.slug) return entry.slug;
+        } catch {}
+    }
+    return null;
+}
+
 // Check if the JSONL shows Claude waiting for interactive input (AskUserQuestion / ExitPlanMode)
 function checkForPendingInteraction(newLines: string[]): PendingInteraction | null {
     // Walk backwards to find the last assistant entry
@@ -198,18 +260,38 @@ function checkForPendingInteraction(newLines: string[]): PendingInteraction | nu
                 if (block.type !== 'tool_use') continue;
 
                 if (block.name === 'AskUserQuestion') {
-                    const q = block.input?.questions?.[0];
-                    if (q) {
-                        return {
-                            type: 'question',
+                    const rawQuestions = block.input?.questions || [];
+                    if (rawQuestions.length > 0) {
+                        // Extract any text blocks from the same assistant entry (context)
+                        const textBlocks = (entry.message?.content || [])
+                            .filter((b: any) => b.type === 'text' && b.text?.trim())
+                            .map((b: any) => b.text.trim());
+                        const questions: QuestionEntry[] = rawQuestions.map((q: any) => ({
                             question: q.question,
                             options: q.options || [],
+                            header: q.header,
+                        }));
+                        return {
+                            type: 'question',
+                            questions,
+                            contextText: textBlocks.length > 0 ? textBlocks.join('\n\n') : undefined,
                         };
                     }
                 }
 
                 if (block.name === 'ExitPlanMode') {
-                    return { type: 'plan' };
+                    // Read plan file matching this session's slug
+                    let planContent = '';
+                    const slug = extractSlug(newLines);
+                    if (slug) {
+                        const planFile = path.join(PLANS_DIR, `${slug}.md`);
+                        try {
+                            if (fs.existsSync(planFile)) {
+                                planContent = fs.readFileSync(planFile, 'utf8').trim();
+                            }
+                        } catch {}
+                    }
+                    return { type: 'plan', planContent: planContent || undefined };
                 }
             }
 
@@ -258,17 +340,48 @@ function findInteractionIndex(newLines: string[]): number {
 
 // Format a pending interaction as a Discord message
 function formatInteractionForDiscord(interaction: PendingInteraction): string {
-    if (interaction.type === 'question' && interaction.options) {
-        let msg = `**Claude is asking a question:**\n\n${interaction.question}\n\n`;
-        interaction.options.forEach((opt, i) => {
-            msg += `**${i + 1}.** ${opt.label} — ${opt.description}\n`;
+    if (interaction.type === 'question' && interaction.questions && interaction.questions.length > 0) {
+        let msg = '';
+        // Include Claude's text context if present (the text before the question)
+        if (interaction.contextText) {
+            msg += interaction.contextText + '\n\n---\n';
+        }
+
+        const multi = interaction.questions.length > 1;
+
+        interaction.questions.forEach((q, qi) => {
+            if (multi) {
+                msg += `**Q${qi + 1}:** `;
+            } else {
+                msg += '**Claude is asking:** ';
+            }
+            msg += `${q.question}\n\n`;
+            q.options.forEach((opt, oi) => {
+                msg += `**${oi + 1}.** ${opt.label} — ${opt.description}\n`;
+            });
+            msg += '\n';
         });
-        msg += `\nReply with a number (1-${interaction.options.length}) to select, or type a custom answer.`;
+
+        msg += '---\n';
+        if (multi) {
+            msg += `Reply with answers separated by commas (e.g. **1, 2, 3**)\n`;
+            msg += `Each position = one question. Use a number to pick an option or text for a custom answer.`;
+        } else {
+            const optCount = interaction.questions[0].options.length;
+            msg += `**1-${optCount}** → select that option\n**anything else** → sent as custom answer`;
+        }
         return msg;
     }
 
     if (interaction.type === 'plan') {
-        return `**Claude has a plan ready for approval.**\n\nReply **yes** to approve or provide feedback to reject.`;
+        let msg = `**Claude has a plan ready for approval:**\n\n`;
+        if (interaction.planContent) {
+            msg += interaction.planContent;
+        } else {
+            msg += '(Could not read plan file)';
+        }
+        msg += `\n\n---\n**yes** / **approve** → execute this plan\n**anything else** → sent as feedback, Claude will revise the plan`;
+        return msg;
     }
 
     return '(Claude is waiting for input — check tmux session)';
@@ -278,92 +391,85 @@ function formatInteractionForDiscord(interaction: PendingInteraction): string {
 function sendInteractionKeystroke(interaction: PendingInteraction, userReply: string): void {
     const reply = userReply.trim();
 
-    if (interaction.type === 'question' && interaction.options) {
-        const optionNum = parseInt(reply, 10);
-        if (optionNum >= 1 && optionNum <= interaction.options.length) {
-            // Navigate to option: Down arrow (N-1) times, then Enter
-            for (let i = 1; i < optionNum; i++) {
-                execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+    if (interaction.type === 'question' && interaction.questions && interaction.questions.length > 0) {
+        // Split reply by commas for multi-question support: "1, 3, 2" or just "1"
+        const answers = reply.split(',').map(a => a.trim());
+
+        for (let qi = 0; qi < interaction.questions.length; qi++) {
+            const q = interaction.questions[qi];
+            const answer = answers[qi] || answers[0]; // fall back to first answer if not enough
+            const optionNum = parseInt(answer, 10);
+
+            // Navigate between questions: Tab moves to next question group
+            if (qi > 0) {
+                execSync(`tmux send-keys -t "${TMUX_TARGET}" Tab`);
+                execSync('sleep 0.1');
             }
-            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
-            log('INFO', `Selected option ${optionNum}: ${interaction.options[optionNum - 1].label}`);
-        } else {
-            // "Other" — navigate past all options to Other, then type text
-            for (let i = 0; i <= interaction.options.length; i++) {
-                execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+
+            if (optionNum >= 1 && optionNum <= q.options.length) {
+                // Navigate to option: Down arrow (N-1) times from default position
+                for (let i = 1; i < optionNum; i++) {
+                    execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+                }
+                log('INFO', `Q${qi + 1}: selected option ${optionNum}: ${q.options[optionNum - 1].label}`);
+            } else {
+                // "Other" — navigate past all options, select it, type text
+                for (let i = 0; i < q.options.length; i++) {
+                    execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+                }
+                // Select "Other" and type custom text
+                execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+                execSync('sleep 0.3');
+                const escaped = answer.replace(/'/g, "'\\''");
+                execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
+                log('INFO', `Q${qi + 1}: selected Other with text: ${answer.substring(0, 50)}`);
             }
-            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
-            // Type the custom text
-            const escaped = reply.replace(/'/g, "'\\''");
-            execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
-            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
-            log('INFO', `Selected Other with text: ${reply.substring(0, 50)}`);
         }
+
+        // Submit the form
+        execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+        log('INFO', `Submitted ${interaction.questions.length} question(s)`);
     } else if (interaction.type === 'plan') {
+        // ExitPlanMode TUI options:
+        //   1. Yes, clear context and bypass permissions (default)
+        //   2. Yes, and bypass permissions
+        //   3. Yes, manually approve edits
+        //   4. Type feedback
         const isApproval = /^(y|yes|approve|accept|ok|go|lgtm)$/i.test(reply);
         if (isApproval) {
-            // Accept the plan — press Enter (default accept)
+            // Select option 2 — "Yes, and bypass permissions"
+            // (option 1 clears context, creating a new JSONL session file)
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
             execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
-            log('INFO', 'Approved plan');
+            log('INFO', 'Approved plan (option 2: bypass permissions)');
         } else {
-            // Reject — press Escape, then type feedback as next message
-            execSync(`tmux send-keys -t "${TMUX_TARGET}" Escape`);
+            // Select option 4 — "Type feedback" for plan iteration
+            // Down x3 from default position, then Enter to select
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
+            execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+            execSync('sleep 0.3');
+            // Type the feedback text and submit
             const escaped = reply.replace(/'/g, "'\\''");
             execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
+            execSync('sleep 0.2');
             execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
-            log('INFO', `Rejected plan with feedback: ${reply.substring(0, 50)}`);
+            log('INFO', `Plan feedback (option 4): ${reply.substring(0, 50)}`);
         }
     }
 }
 
-// Snapshot plan files at a point in time
-function snapshotPlans(): Map<string, number> {
-    const snapshot = new Map<string, number>();
-    try {
-        if (fs.existsSync(PLANS_DIR)) {
-            for (const file of fs.readdirSync(PLANS_DIR)) {
-                if (file.endsWith('.md')) {
-                    const filePath = path.join(PLANS_DIR, file);
-                    const stat = fs.statSync(filePath);
-                    snapshot.set(filePath, stat.mtimeMs);
-                }
-            }
-        }
-    } catch {}
-    return snapshot;
-}
-
-// Check for new or modified plan files since a snapshot
-function checkForNewPlan(before: Map<string, number>): string | null {
-    try {
-        if (!fs.existsSync(PLANS_DIR)) return null;
-        for (const file of fs.readdirSync(PLANS_DIR)) {
-            if (!file.endsWith('.md')) continue;
-            const filePath = path.join(PLANS_DIR, file);
-            const stat = fs.statSync(filePath);
-            const prevMtime = before.get(filePath);
-            if (prevMtime === undefined || stat.mtimeMs > prevMtime) {
-                const content = fs.readFileSync(filePath, 'utf8').trim();
-                if (content.length > 0) {
-                    return `**Claude has a plan ready for approval:**\n\n${content}`;
-                }
-            }
-        }
-    } catch {}
-    return null;
-}
+// (Plan detection is handled via ExitPlanMode in JSONL — no file polling needed)
 
 // Wait for Claude's response by watching all JSONL files for growth
 async function waitForResponse(beforeSnapshot: Map<string, number>): Promise<string> {
-    const plansBefore = snapshotPlans();
-
     return new Promise((resolve) => {
         const startTime = Date.now();
         let activeFile: string | null = null;
         let startLine = 0;
         let lastLineCount = 0;
         let lastGrowthAt = 0;
-        let planLastChecked = Date.now();
 
         const check = setInterval(() => {
             // Phase 1: Detect which file is receiving our message
@@ -383,9 +489,31 @@ async function waitForResponse(beforeSnapshot: Map<string, number>): Promise<str
                 const currentLineCount = getFileLineCount(activeFile);
 
                 if (currentLineCount > lastLineCount) {
+                    log('DEBUG', `JSONL grew: ${lastLineCount} → ${currentLineCount} lines`);
                     lastLineCount = currentLineCount;
                     lastGrowthAt = Date.now();
                 }
+
+                // Check for file rotation (e.g., "clear context" creates a new session)
+                // If a newer JSONL file exists that wasn't in our snapshot, switch to it
+                try {
+                    for (const f of fs.readdirSync(JSONL_DIR)) {
+                        if (!f.endsWith('.jsonl')) continue;
+                        const filePath = path.join(JSONL_DIR, f);
+                        if (filePath === activeFile) continue;
+                        if (!beforeSnapshot.has(filePath)) {
+                            // Brand new file created after we started — this is the new session
+                            const newCount = getFileLineCount(filePath);
+                            if (newCount > 0) {
+                                log('INFO', `JSONL file rotated: ${path.basename(activeFile)} → ${path.basename(filePath)}`);
+                                activeFile = filePath;
+                                startLine = 0;
+                                lastLineCount = newCount;
+                                lastGrowthAt = Date.now();
+                            }
+                        }
+                    }
+                } catch {}
 
                 const newLines = readNewLines(activeFile, startLine);
 
@@ -402,43 +530,41 @@ async function waitForResponse(beforeSnapshot: Map<string, number>): Promise<str
                     return;
                 }
 
-                // Fallback: quiet period — check for pending interaction or plain text
+                // Quiet-period checks: interaction detection + stop_hook_summary fallback
                 if (lastGrowthAt > 0 && newLines.length > 0) {
                     const quietFor = Date.now() - lastGrowthAt;
-                    if (quietFor >= QUIET_THRESHOLD) {
-                        // Check if Claude is waiting for interactive input
+                    if (quietFor >= INTERACTION_QUIET_THRESHOLD) {
+                        // Check for pending interaction (AskUserQuestion/ExitPlanMode)
                         const interactionIdx = findInteractionIndex(newLines);
-                        if (interactionIdx >= 0 && !hasToolResult(newLines, interactionIdx)) {
-                            const interaction = checkForPendingInteraction(newLines);
-                            if (interaction) {
-                                clearInterval(check);
-                                pendingInteraction = interaction;
-                                log('INFO', `Detected pending ${interaction.type} interaction`);
-                                resolve(formatInteractionForDiscord(interaction));
-                                return;
+                        if (interactionIdx >= 0) {
+                            const hasResult = hasToolResult(newLines, interactionIdx);
+                            log('DEBUG', `Interaction found at idx ${interactionIdx}, hasToolResult=${hasResult}, quiet=${quietFor}ms`);
+                            if (!hasResult) {
+                                const interaction = checkForPendingInteraction(newLines);
+                                if (interaction) {
+                                    clearInterval(check);
+                                    pendingInteraction = interaction;
+                                    log('INFO', `Detected pending ${interaction.type} interaction after ${quietFor}ms quiet`);
+                                    resolve(formatInteractionForDiscord(interaction));
+                                    return;
+                                } else {
+                                    log('DEBUG', 'findInteractionIndex matched but checkForPendingInteraction returned null');
+                                }
                             }
                         }
 
-                        // Otherwise return last text if available
-                        const text = extractLastAssistantText(newLines);
-                        if (text) {
-                            clearInterval(check);
-                            log('INFO', `Responding after ${QUIET_THRESHOLD}ms quiet (no turn_duration yet)`);
-                            resolve(text);
-                            return;
+                        // Fallback: stop_hook_summary as last entry + quiet = turn likely ended
+                        // (turn_duration isn't always written)
+                        if (lastEntryIsSystemBoundary(newLines)) {
+                            const text = extractLastAssistantText(newLines);
+                            if (text) {
+                                clearInterval(check);
+                                log('INFO', `Turn ended (stop_hook_summary + ${quietFor}ms quiet)`);
+                                resolve(text);
+                                return;
+                            }
                         }
                     }
-                }
-            }
-
-            // Check for new plan files every 5 seconds
-            if (Date.now() - planLastChecked >= 5000) {
-                planLastChecked = Date.now();
-                const plan = checkForNewPlan(plansBefore);
-                if (plan) {
-                    clearInterval(check);
-                    resolve(plan);
-                    return;
                 }
             }
 
@@ -490,17 +616,11 @@ async function processMessage(messageFile: string): Promise<void> {
         // Wait for response — detects which file grows after our send-keys
         const response = await waitForResponse(beforeSnapshot);
 
-        // Limit response length for Discord
-        let trimmedResponse = response;
-        if (trimmedResponse.length > 4000) {
-            trimmedResponse = trimmedResponse.substring(0, 3900) + '\n\n[Response truncated...]';
-        }
-
-        // Write response to outgoing queue
+        // Write response to outgoing queue (Discord client handles splitting into 2000-char messages)
         const responseData: ResponseData = {
             channel,
             sender,
-            message: trimmedResponse,
+            message: response,
             originalMessage: message,
             timestamp: Date.now(),
             messageId
@@ -512,7 +632,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
         fs.writeFileSync(responseFile, JSON.stringify(responseData, null, 2));
 
-        log('INFO', `✓ Response ready [${channel}] ${sender} (${trimmedResponse.length} chars)`);
+        log('INFO', `✓ Response ready [${channel}] ${sender} (${response.length} chars)`);
 
         // Clean up processing file
         fs.unlinkSync(processingFile);
