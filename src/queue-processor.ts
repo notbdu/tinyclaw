@@ -118,8 +118,9 @@ function sendToClaudePane(message: string, sender: string): void {
     const prefixed = `[Discord message from ${sender}]: ${cleanMessage}`;
     const escaped = prefixed.replace(/'/g, "'\\''");
     execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
-    // Small delay to let the TUI process the text before submitting
-    execSync('sleep 0.2');
+    // Scale delay for longer messages — bracketed paste needs more processing time
+    const delay = Math.max(0.3, Math.min(2.0, prefixed.length / 500));
+    execSync(`sleep ${delay}`);
     execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
 }
 
@@ -400,17 +401,14 @@ function sendInteractionKeystroke(interaction: PendingInteraction, userReply: st
             const answer = answers[qi] || answers[0]; // fall back to first answer if not enough
             const optionNum = parseInt(answer, 10);
 
-            // Navigate between questions: Tab moves to next question group
-            if (qi > 0) {
-                execSync(`tmux send-keys -t "${TMUX_TARGET}" Tab`);
-                execSync('sleep 0.1');
-            }
-
             if (optionNum >= 1 && optionNum <= q.options.length) {
                 // Navigate to option: Down arrow (N-1) times from default position
                 for (let i = 1; i < optionNum; i++) {
                     execSync(`tmux send-keys -t "${TMUX_TARGET}" Down`);
                 }
+                // Enter confirms selection AND advances to next question tab
+                execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+                execSync('sleep 0.3');
                 log('INFO', `Q${qi + 1}: selected option ${optionNum}: ${q.options[optionNum - 1].label}`);
             } else {
                 // "Other" — navigate past all options, select it, type text
@@ -422,11 +420,16 @@ function sendInteractionKeystroke(interaction: PendingInteraction, userReply: st
                 execSync('sleep 0.3');
                 const escaped = answer.replace(/'/g, "'\\''");
                 execSync(`tmux send-keys -t "${TMUX_TARGET}" -l '${escaped}'`);
+                // Confirm custom text and advance to next question tab
+                execSync('sleep 0.2');
+                execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
+                execSync('sleep 0.3');
                 log('INFO', `Q${qi + 1}: selected Other with text: ${answer.substring(0, 50)}`);
             }
         }
 
-        // Submit the form
+        // After all questions, TUI shows "Ready to submit?" confirmation — submit it
+        execSync('sleep 0.3');
         execSync(`tmux send-keys -t "${TMUX_TARGET}" Enter`);
         log('INFO', `Submitted ${interaction.questions.length} question(s)`);
     } else if (interaction.type === 'plan') {
